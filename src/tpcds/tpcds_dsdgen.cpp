@@ -138,6 +138,8 @@ int TPCDSTableGenerator::generate_call_center() {
     mk_w_call_center(&loader, i);
   }
 
+  loader.flush();  // Ensure all remaining rows are committed
+
   return loader.row_count();
 }
 
@@ -151,6 +153,8 @@ int TPCDSTableGenerator::generate_catalog_page() {
     // cp_department is only set once
     mk_w_catalog_page(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -168,6 +172,10 @@ int TPCDSTableGenerator::generate_catalog_sales_and_returns() {
     mk_w_catalog_sales(&loaders, catalog_page_index);
   }
 
+  // Flush both loaders to commit remaining rows
+  loader_catalog_sales.flush();
+  loader_catalog_returns.flush();
+
   // TODO: result
   return std::max(loader_catalog_returns.row_count(), loader_catalog_sales.row_count());
 }
@@ -181,6 +189,8 @@ int TPCDSTableGenerator::generate_customer_address() {
     mk_w_customer_address(&loader, catalog_page_index);
   }
 
+  loader.flush();  // Ensure all remaining rows are committed
+
   return loader.row_count();
 }
 
@@ -192,6 +202,8 @@ int TPCDSTableGenerator::generate_customer() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_customer(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -205,6 +217,8 @@ int TPCDSTableGenerator::generate_customer_demographics() {
     mk_w_customer_demographics(&loader, catalog_page_index);
   }
 
+  loader.flush();  // Ensure all remaining rows are committed
+
   return loader.row_count();
 }
 
@@ -216,6 +230,8 @@ int TPCDSTableGenerator::generate_date_dim() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_date(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -229,6 +245,8 @@ int TPCDSTableGenerator::generate_household_demographics() {
     mk_w_household_demographics(&loader, catalog_page_index);
   }
 
+  loader.flush();  // Ensure all remaining rows are committed
+
   return loader.row_count();
 }
 
@@ -240,6 +258,8 @@ int TPCDSTableGenerator::generate_income_band() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_income_band(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -253,6 +273,8 @@ int TPCDSTableGenerator::generate_inventory() {
     mk_w_inventory(&loader, catalog_page_index);
   }
 
+  loader.flush();  // Ensure all remaining rows are committed
+
   return loader.row_count();
 }
 
@@ -264,6 +286,8 @@ int TPCDSTableGenerator::generate_item() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_item(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -277,6 +301,8 @@ int TPCDSTableGenerator::generate_promotion() {
     mk_w_promotion(&loader, catalog_page_index);
   }
 
+  loader.flush();  // Ensure all remaining rows are committed
+
   return loader.row_count();
 }
 
@@ -288,6 +314,8 @@ int TPCDSTableGenerator::generate_reason() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_reason(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -301,6 +329,8 @@ int TPCDSTableGenerator::generate_ship_mode() {
     mk_w_ship_mode(&loader, catalog_page_index);
   }
 
+  loader.flush();  // Ensure all remaining rows are committed
+
   return loader.row_count();
 }
 
@@ -312,6 +342,8 @@ int TPCDSTableGenerator::generate_store() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_store(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -329,6 +361,10 @@ int TPCDSTableGenerator::generate_store_sales_and_returns() {
     mk_w_store_sales(&loaders, catalog_page_index);
   }
 
+  // Flush both loaders to commit remaining rows
+  loader_store_sales.flush();
+  loader_store_returns.flush();
+
   return std::max(loader_store_sales.row_count(), loader_store_returns.row_count());
 }
 
@@ -340,6 +376,8 @@ int TPCDSTableGenerator::generate_time_dim() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_time(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -353,6 +391,8 @@ int TPCDSTableGenerator::generate_warehouse() {
     mk_w_warehouse(&loader, catalog_page_index);
   }
 
+  loader.flush();  // Ensure all remaining rows are committed
+
   return loader.row_count();
 }
 
@@ -364,6 +404,8 @@ int TPCDSTableGenerator::generate_web_page() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_web_page(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }
@@ -381,6 +423,10 @@ int TPCDSTableGenerator::generate_web_sales_and_returns() {
     mk_w_web_sales(&loaders, catalog_page_index);
   }
 
+  // Flush both loaders to commit remaining rows
+  loader_web_sales.flush();
+  loader_web_returns.flush();
+
   return std::max(loader_web_sales.row_count(), loader_web_returns.row_count());
 }
 
@@ -392,6 +438,8 @@ int TPCDSTableGenerator::generate_web_site() {
   for (auto catalog_page_index = k_first_row; k_row_count; catalog_page_index++, k_row_count--) {
     mk_w_web_site(&loader, catalog_page_index);
   }
+
+  loader.flush();  // Ensure all remaining rows are committed
 
   return loader.row_count();
 }

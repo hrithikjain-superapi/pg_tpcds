@@ -28,7 +28,7 @@ static auto get_extension_external_directory(void) {
   char sharepath[MAXPGPATH];
 
   get_share_path(my_exec_path, sharepath);
-  auto path = std::format("{}/extension/tpcds", sharepath);
+  auto path = std::format("{}/extension/src/tpcds", sharepath);
   return std::move(path);
 }
 

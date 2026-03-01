@@ -35,6 +35,8 @@ namespace tpcds {
 
 class TableLoader {
  public:
+  static constexpr size_t BATCH_SIZE = 100000;  // Commit every 100k rows
+
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
     rel_ = try_table_open(reloid_, NoLock);
@@ -59,6 +61,7 @@ class TableLoader {
   };
 
   ~TableLoader() {
+    flush();  // Ensure remaining buffered rows are committed
     table_close(rel_, NoLock);
     free(in_functions);
     free(typioparams);
@@ -169,18 +172,38 @@ class TableLoader {
   auto& end() {
     ExecStoreVirtualTuple(slot);
 
+    // Insert the tuple immediately
     table_tuple_insert(rel_, slot, mycid, ti_options, NULL);
 
     row_count_++;
+    rows_in_buffer_++;
+
+    // Auto-flush when batch is full
+    if (rows_in_buffer_ >= BATCH_SIZE) {
+      flush();
+    }
+
     return *this;
   }
 
   auto row_count() const { return row_count_; }
 
+  void flush() {
+    if (rows_in_buffer_ == 0) return;
+
+    // Commit current transaction and start new one
+    SPI_commit();
+    SPI_start_transaction();
+
+    // Reset buffer counter
+    rows_in_buffer_ = 0;
+  }
+
   Oid reloid_;
   Relation rel_;
   size_t row_count_ = 0;
   size_t current_item_ = 0;
+  size_t rows_in_buffer_ = 0;
 
   FmgrInfo* in_functions;
   Oid* typioparams;

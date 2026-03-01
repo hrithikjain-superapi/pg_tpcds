@@ -167,21 +167,24 @@ int TPCDSWrapper::DSDGen(int scale, char *table) {
   CASE_ERROR(web_returns)
 
   if (std::string{table} == "catalog_sales") {
-    return generator.generate_catalog_sales_and_returns();
+    auto row_count = generator.generate_catalog_sales_and_returns();
     Executor executor;
     executor.execute("reindex table catalog_sales; reindex table catalog_returns");
+    return row_count;
   }
 
   if (std::string{table} == "store_sales") {
-    return generator.generate_store_sales_and_returns();
+    auto row_count = generator.generate_store_sales_and_returns();
     Executor executor;
     executor.execute("reindex table store_sales; reindex table store_returns");
+    return row_count;
   }
 
   if (std::string{table} == "web_sales") {
-    return generator.generate_web_sales_and_returns();
+    auto row_count = generator.generate_web_sales_and_returns();
     Executor executor;
     executor.execute("reindex table web_sales; reindex table web_returns");
+    return row_count;
   }
 
 #undef CASE_ERROR

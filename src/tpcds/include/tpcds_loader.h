@@ -16,10 +16,17 @@
 // - COPY FROM STDIN with CopyState API requires complex cursor handling
 // - Multi-row INSERT VALUES achieves similar performance with simpler implementation
 //
+// SPI CONTEXT MANAGEMENT:
+// - TableLoader relies on parent function's SPI context (no SPI_connect/finish here)
+// - Called from dsdgen_internal() which is a PG_FUNCTION (receives PG_FUNCTION_ARGS)
+// - PostgreSQL automatically establishes SPI context for all C functions
+// - SPI_exec() in flush() uses this parent context
+// - IMPORTANT: Nested SPI_connect() calls are NOT allowed and cause SPI_ERROR_UNCONNECTED
+//
 // Implementation: 
 // - Generate SQL-escaped string values in memory (std::vector<std::string>)
 // - Build INSERT INTO table VALUES (row1), (row2), ..., (rowN) statement
-// - Execute via SPI_exec as single batch
+// - Execute via SPI_exec as single batch (uses parent SPI context)
 // - Memory is released after each batch
 //
 // Performance characteristics:
@@ -71,11 +78,6 @@ class TableLoader {
   static constexpr size_t BATCH_SIZE = 1000;  // Flush every 1000 rows for optimal performance
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
-    // Connect to SPI for executing INSERT statements
-    if (SPI_connect() != SPI_OK_CONNECT) {
-      throw std::runtime_error("SPI_connect Failed");
-    }
-    
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
     rel_ = try_table_open(reloid_, NoLock);
     if (!rel_)
@@ -91,7 +93,6 @@ class TableLoader {
   ~TableLoader() {
     flush();  // Ensure remaining rows are committed
     table_close(rel_, NoLock);
-    SPI_finish();  // Disconnect from SPI
   };
 
   bool ColnullCheck() { return nullCheck(table_def->first_column + current_item_); }

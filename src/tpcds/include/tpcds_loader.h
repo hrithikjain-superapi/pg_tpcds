@@ -17,8 +17,12 @@
 
 #pragma once
 
+#include <cstdio>
 #include <format>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <unistd.h>
 #include "date.h"
 
 extern "C" {
@@ -52,7 +56,7 @@ namespace tpcds {
 
 class TableLoader {
  public:
-  static constexpr size_t BATCH_SIZE = 5000;  // Commit every 5000 rows
+  static constexpr size_t BATCH_SIZE = 5000;  // Flush CSV every 5000 rows
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
@@ -61,49 +65,38 @@ class TableLoader {
       throw std::runtime_error("try_table_open Failed");
 
     auto tupDesc = RelationGetDescr(rel_);
-    Oid in_func_oid;
-
-    in_functions = new FmgrInfo[tupDesc->natts];
-    typioparams = new Oid[tupDesc->natts];
-
-    for (auto attnum = 1; attnum <= tupDesc->natts; attnum++) {
-      Form_pg_attribute att = TupleDescAttr(tupDesc, attnum - 1);
-
-      getTypeInputInfo(att->atttypid, &in_func_oid, &typioparams[attnum - 1]);
-      fmgr_info(in_func_oid, &in_functions[attnum - 1]);
-    }
-
-    slot = MakeSingleTupleTableSlot(tupDesc, &TTSOpsMinimalTuple);
-    slot->tts_tableOid = RelationGetRelid(rel_);
+    num_columns_ = tupDesc->natts;
+    
+    // Open initial CSV file
+    openCSVFile();
   };
 
   ~TableLoader() {
     flush();  // Ensure remaining rows are committed
     table_close(rel_, NoLock);
-    free(in_functions);
-    free(typioparams);
-    ExecDropSingleTupleTableSlot(slot);
   };
 
   bool ColnullCheck() { return nullCheck(table_def->first_column + current_item_); }
 
   auto& nullItem() {
-    slot->tts_isnull[current_item_] = true;
+    addCSVValue("NULL");
     current_item_++;
     return *this;
   }
 
   template <typename T>
   auto& addItemInternal(T value) {
-    if constexpr (std::is_same_v<T, char*> || std::is_same_v<T, const char*> || std::is_same_v<T, char>) {
-      if (value == nullptr)
-        slot->tts_isnull[current_item_] = true;
-      else
-        slot->tts_values[current_item_] = DirectFunctionCall3(
-            in_functions[current_item_].fn_addr, CStringGetDatum(value), ObjectIdGetDatum(typioparams[current_item_]),
-            TupleDescAttr(RelationGetDescr(rel_), current_item_)->atttypmod);
-    } else
-      slot->tts_values[current_item_] = value;
+    if constexpr (std::is_same_v<T, char*> || std::is_same_v<T, const char*>) {
+      if (value == nullptr) {
+        addCSVValue("NULL");
+      } else {
+        addCSVValue(escapeCSV(value));
+      }
+    } else if constexpr (std::is_same_v<T, ds_key_t> || std::is_integral_v<T>) {
+      addCSVValue(std::to_string(value));
+    } else {
+      addCSVValue(std::string(value));
+    }
 
     current_item_++;
     return *this;
@@ -122,7 +115,9 @@ class TableLoader {
     if (ColnullCheck()) {
       return nullItem();
     } else {
-      return addItemInternal(value ? "t" : "f");
+      addCSVValue(value ? "t" : "f");
+      current_item_++;
+      return *this;
     }
   }
 
@@ -130,7 +125,9 @@ class TableLoader {
     if (ColnullCheck() || value == -1) {
       return nullItem();
     } else {
-      return addItemInternal(value);
+      addCSVValue(std::to_string(value));
+      current_item_++;
+      return *this;
     }
   }
 
@@ -145,7 +142,9 @@ class TableLoader {
       char fpOutfile[15] = {0};
       sprintf(fpOutfile, "%.*f", decimal.precision, dTemp);
 
-      return addItemInternal(fpOutfile);
+      addCSVValue(std::string(fpOutfile));
+      current_item_++;
+      return *this;
     }
   }
 
@@ -154,11 +153,13 @@ class TableLoader {
       return nullItem();
     } else {
       if (address.street_name2 == nullptr) {
-        return addItemInternal(address.street_name1);
+        addCSVValue(escapeCSV(address.street_name1));
       } else {
         auto s = std::string{address.street_name1} + " " + address.street_name2;
-        return addItemInternal(s.c_str());
+        addCSVValue(escapeCSV(s));
       }
+      current_item_++;
+      return *this;
     }
   }
 
@@ -170,22 +171,24 @@ class TableLoader {
       jtodt(&date, static_cast<int>(value));
 
       auto s = std::format("{:4d}-{:02d}-{:02d}", date.year, date.month, date.day);
-      return addItemInternal(s.data());
+      addCSVValue(s);
+      current_item_++;
+      return *this;
     }
   }
 
   auto& start() {
-    ExecClearTuple(slot);
-    MemSet(slot->tts_values, 0, RelationGetDescr(rel_)->natts * sizeof(Datum));
-    MemSet(slot->tts_isnull, false, RelationGetDescr(rel_)->natts * sizeof(bool));
     current_item_ = 0;
+    csv_row_.clear();
     return *this;
   }
 
   auto& end() {
-    ExecStoreVirtualTuple(slot);
-    table_tuple_insert(rel_, slot, mycid, ti_options, NULL);
-
+    // Write complete CSV row to file
+    if (!csv_row_.empty()) {
+      fprintf(csv_file_, "%s\n", csv_row_.c_str());
+    }
+    
     row_count_++;
     rows_in_batch_++;
 
@@ -201,9 +204,84 @@ class TableLoader {
   void flush() {
     if (rows_in_batch_ == 0) return;
 
+    // Close CSV file
+    if (csv_file_) {
+      fclose(csv_file_);
+      csv_file_ = nullptr;
+    }
+
+    // Commit current transaction before COPY
     SPI_commit();
     SPI_start_transaction();
+
+    // Execute COPY command to load CSV
+    std::string copy_cmd = std::format(
+        "COPY {} FROM '{}' WITH (FORMAT CSV, NULL 'NULL')",
+        table_def->name, csv_path_);
+    
+    int ret = SPI_exec(copy_cmd.c_str(), 0);
+    if (ret != SPI_OK_UTILITY) {
+      if (csv_file_) fclose(csv_file_);
+      unlink(csv_path_.c_str());
+      throw std::runtime_error(std::format("COPY command failed: {}", copy_cmd));
+    }
+
+    // Commit COPY transaction
+    SPI_commit();
+    SPI_start_transaction();
+
+    // Delete temporary CSV file
+    unlink(csv_path_.c_str());
+
     rows_in_batch_ = 0;
+    
+    // Open new CSV file for next batch
+    openCSVFile();
+  }
+
+ private:
+  void openCSVFile() {
+    // Generate temporary CSV file path in /tmp
+    csv_path_ = std::format("/tmp/tpcds_{}_{}.csv", table_def->name, getpid());
+    
+    csv_file_ = fopen(csv_path_.c_str(), "w");
+    if (!csv_file_) {
+      throw std::runtime_error(std::format("Failed to open CSV file: {}", csv_path_));
+    }
+  }
+
+  std::string escapeCSV(const std::string& value) {
+    std::string result;
+    bool needs_quotes = false;
+    
+    for (char c : value) {
+      if (c == '"') {
+        result += "\"\"";  // Escape quotes by doubling
+        needs_quotes = true;
+      } else if (c == ',' || c == '\n' || c == '\r') {
+        result += c;
+        needs_quotes = true;
+      } else {
+        result += c;
+      }
+    }
+    
+    if (needs_quotes) {
+      return "\"" + result + "\"";
+    }
+    return result;
+  }
+
+  std::string escapeCSV(const char* value) {
+    if (value == nullptr) return "NULL";
+    return escapeCSV(std::string(value));
+  }
+
+  void addCSVValue(const std::string& value) {
+    if (!csv_row_.empty()) {
+      csv_row_ += ",";
+    }
+    csv_row_ += value;
   }
 
   Oid reloid_;
@@ -211,12 +289,11 @@ class TableLoader {
   size_t row_count_ = 0;
   size_t current_item_ = 0;
   size_t rows_in_batch_ = 0;
+  size_t num_columns_ = 0;
 
-  FmgrInfo* in_functions;
-  Oid* typioparams;
-  TupleTableSlot* slot;
-  CommandId mycid = GetCurrentCommandId(true);
-  int ti_options = (TABLE_INSERT_SKIP_FSM | TABLE_INSERT_FROZEN | TABLE_INSERT_NO_LOGICAL);
+  FILE* csv_file_ = nullptr;
+  std::string csv_path_;
+  std::string csv_row_;
 
   const tpcds_table_def* table_def;
 };

@@ -1,3 +1,20 @@
+// MEMORY USAGE ANALYSIS:
+// Current approach (tuple-insert with batch commits):
+// - Per-row memory: TupleTableSlot (120-200 bytes) + Datum array (~80 bytes/row for typical table)
+//                  + FmgrInfo array + type conversion overhead
+// - Batch memory: 5000 rows × ~200-300 bytes/row = ~1-1.5 MB per batch minimum
+// - Additional overhead: PostgreSQL WAL buffers, SPI context, type conversion functions
+// - Estimated total: ~5-10 MB per 5000 rows (varies by table schema complexity)
+//
+// Root cause: table_tuple_insert() (line 170) constructs full tuples in memory before SPI_commit()
+//            Each row requires TupleTableSlot allocation, Datum conversions, and WAL buffer space
+//            Memory accumulates until SPI_commit() at BATCH_SIZE intervals (line 187-188)
+//
+// Solution: CSV generation + PostgreSQL COPY command
+//          - Generate CSV to temporary file (minimal memory: ~4KB buffer)
+//          - Use COPY FROM to bulk load (PostgreSQL handles parsing efficiently)
+//          - Memory reduction: ~99% (from ~10 MB to ~10 KB per 5000 rows)
+
 #pragma once
 
 #include <format>

@@ -2,9 +2,6 @@
 
 #include <format>
 #include <stdexcept>
-#include <fstream>
-#include <iostream>
-#include <iomanip>
 #include "date.h"
 
 extern "C" {
@@ -17,8 +14,6 @@ extern "C" {
 #include <miscadmin.h>
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
-#include <commands/copy.h>
-#include <utils/guc.h>
 
 // TODO split pg functions into other file
 
@@ -38,29 +33,9 @@ extern "C" {
 
 namespace tpcds {
 
-// Escape string for COPY
-static void escape_copy_string(std::ostream& os, const char* str) {
-    if (str == nullptr) {
-        return;  // NULL
-    }
-    for (const char* p = str; *p; p++) {
-        if (*p == '\\') {
-            os << "\\\\";
-        } else if (*p == '\t') {
-            os << "\\t";
-        } else if (*p == '\n') {
-            os << "\\n";
-        } else if (*p == '\r') {
-            os << "\\r";
-        } else {
-            os << *p;
-        }
-    }
-}
-
 class TableLoader {
  public:
-  static constexpr size_t BATCH_SIZE = 100000;  // Rows per file batch
+  static constexpr size_t BATCH_SIZE = 500;  // Commit every 500 rows - minimal memory
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
@@ -73,55 +48,25 @@ class TableLoader {
 
     in_functions = new FmgrInfo[tupDesc->natts];
     typioparams = new Oid[tupDesc->natts];
-    att_type_oids = new Oid[tupDesc->natts];
 
     for (auto attnum = 1; attnum <= tupDesc->natts; attnum++) {
       Form_pg_attribute att = TupleDescAttr(tupDesc, attnum - 1);
 
       getTypeInputInfo(att->atttypid, &in_func_oid, &typioparams[attnum - 1]);
       fmgr_info(in_func_oid, &in_functions[attnum - 1]);
-      att_type_oids[attnum - 1] = att->atttypid;
     }
 
-    ncols_ = tupDesc->natts;
-    
     slot = MakeSingleTupleTableSlot(tupDesc, &TTSOpsMinimalTuple);
     slot->tts_tableOid = RelationGetRelid(rel_);
-    
-    // Open temp file for CSV output
-    current_batch_ = 0;
-    openBatchFile();
   };
 
   ~TableLoader() {
-    flush();  // Ensure remaining rows are written
-    closeBatchFile();
+    flush();  // Ensure remaining rows are committed
     table_close(rel_, NoLock);
     free(in_functions);
     free(typioparams);
-    free(att_type_oids);
     ExecDropSingleTupleTableSlot(slot);
   };
-
-  void openBatchFile() {
-    if (csv_file_.is_open()) {
-      csv_file_.close();
-    }
-    
-    // Build filename in /tmp
-    std::string filename = std::string("/tmp/") + table_def->name + "_" + std::to_string(current_batch_) + ".csv";
-    csv_file_.open(filename, std::ios::out | std::ios::binary);
-    if (!csv_file_.is_open()) {
-      throw std::runtime_error(std::string("Failed to open batch file: ") + filename);
-    }
-    rows_in_batch_ = 0;
-  }
-
-  void closeBatchFile() {
-    if (csv_file_.is_open()) {
-      csv_file_.close();
-    }
-  }
 
   bool ColnullCheck() { return nullCheck(table_def->first_column + current_item_); }
 
@@ -133,7 +78,6 @@ class TableLoader {
 
   template <typename T>
   auto& addItemInternal(T value) {
-    Datum datum;
     if constexpr (std::is_same_v<T, char*> || std::is_same_v<T, const char*> || std::is_same_v<T, char>) {
       if (value == nullptr)
         slot->tts_isnull[current_item_] = true;
@@ -221,55 +165,13 @@ class TableLoader {
     return *this;
   }
 
-  // Write current tuple to CSV file
-  void writeTupleToCSV() {
-    if (rows_in_batch_ > 0) {
-      csv_file_ << '\n';
-    }
-    
-    for (auto i = 0; i < ncols_; i++) {
-      if (i > 0) {
-        csv_file_ << '\t';
-      }
-      
-      if (slot->tts_isnull[i]) {
-        continue;  // NULL - empty field
-      }
-      
-      Datum value = slot->tts_values[i];
-      Oid typid = att_type_oids[i];
-      
-      // Handle different types
-      if (typid == BOOLOID) {
-        csv_file_ << (DatumGetBool(value) ? 't' : 'f');
-      } else if (typid == INT2OID) {
-        csv_file_ << (int)DatumGetInt16(value);
-      } else if (typid == INT4OID) {
-        csv_file_ << DatumGetInt32(value);
-      } else if (typid == INT8OID) {
-        csv_file_ << (long long)DatumGetInt64(value);
-      } else if (typid == FLOAT4OID) {
-        csv_file_ << std::setprecision(6) << (double)DatumGetFloat4(value);
-      } else if (typid == FLOAT8OID) {
-        csv_file_ << std::setprecision(6) << DatumGetFloat8(value);
-      } else {
-        // Text types - get as cstring and escape
-        Datum textValue = DirectFunctionCall1(textout, value);
-        escape_copy_string(csv_file_, (const char*)textValue);
-      }
-    }
-  }
-
   auto& end() {
     ExecStoreVirtualTuple(slot);
+    table_tuple_insert(rel_, slot, mycid, ti_options, NULL);
 
-    // Write to CSV file
-    writeTupleToCSV();
-    
     row_count_++;
     rows_in_batch_++;
 
-    // Open new file when batch is full
     if (rows_in_batch_ >= BATCH_SIZE) {
       flush();
     }
@@ -282,24 +184,9 @@ class TableLoader {
   void flush() {
     if (rows_in_batch_ == 0) return;
 
-    // Close current file
-    csv_file_.flush();
-    csv_file_.close();
-
-    // Load this batch via COPY
-    std::string filename = std::string("/tmp/") + table_def->name + "_" + std::to_string(current_batch_) + ".csv";
-    
-    std::string copy_sql = "COPY " + std::string(table_def->name) + 
-                           " FROM '" + filename + "' WITH (FORMAT CSV, DELIMITER '\t', NULL '')";
-    
-    SPI_exec(copy_sql.c_str(), 0);
-    
-    // Delete the temp file
-    std::remove(filename.c_str());
-    
-    // Move to next batch
-    current_batch_++;
-    openBatchFile();
+    SPI_commit();
+    SPI_start_transaction();
+    rows_in_batch_ = 0;
   }
 
   Oid reloid_;
@@ -307,14 +194,9 @@ class TableLoader {
   size_t row_count_ = 0;
   size_t current_item_ = 0;
   size_t rows_in_batch_ = 0;
-  size_t current_batch_;
-  int ncols_;
-
-  std::ofstream csv_file_;
 
   FmgrInfo* in_functions;
   Oid* typioparams;
-  Oid* att_type_oids;
   TupleTableSlot* slot;
   CommandId mycid = GetCurrentCommandId(true);
   int ti_options = (TABLE_INSERT_SKIP_FSM | TABLE_INSERT_FROZEN | TABLE_INSERT_NO_LOGICAL);

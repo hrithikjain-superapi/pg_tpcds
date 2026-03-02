@@ -35,7 +35,7 @@ namespace tpcds {
 
 class TableLoader {
  public:
-  static constexpr size_t BATCH_SIZE = 500;  // Commit every 500 rows - minimal memory
+  static constexpr size_t BATCH_SIZE = 5000;  // Commit every 5000 rows
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
@@ -182,9 +182,11 @@ class TableLoader {
   auto row_count() const { return row_count_; }
 
   void flush() {
-    // No explicit transaction management - PostgreSQL handles it automatically
-    // BATCH_SIZE is kept for potential future use but currently we rely on
-    // PostgreSQL's automatic transaction handling when called from plpgsql
+    if (rows_in_batch_ == 0) return;
+
+    SPI_commit();
+    SPI_start_transaction();
+    rows_in_batch_ = 0;
   }
 
   Oid reloid_;

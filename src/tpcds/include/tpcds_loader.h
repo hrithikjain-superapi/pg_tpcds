@@ -75,7 +75,7 @@ namespace tpcds {
 
 class TableLoader {
  public:
-  static constexpr size_t BATCH_SIZE = 1000;  // Flush every 1000 rows for optimal performance
+  static constexpr size_t BATCH_SIZE = 50000;  // Flush every 50000 rows - balance memory vs commits
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));

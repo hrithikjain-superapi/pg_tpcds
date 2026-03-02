@@ -182,11 +182,9 @@ class TableLoader {
   auto row_count() const { return row_count_; }
 
   void flush() {
-    if (rows_in_batch_ == 0) return;
-
-    SPI_commit();
-    SPI_start_transaction();
-    rows_in_batch_ = 0;
+    // No explicit transaction management - PostgreSQL handles it automatically
+    // BATCH_SIZE is kept for potential future use but currently we rely on
+    // PostgreSQL's automatic transaction handling when called from plpgsql
   }
 
   Oid reloid_;

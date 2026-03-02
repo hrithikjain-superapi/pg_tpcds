@@ -1,28 +1,34 @@
-// MEMORY USAGE ANALYSIS:
-// Current approach (tuple-insert with batch commits):
-// - Per-row memory: TupleTableSlot (120-200 bytes) + Datum array (~80 bytes/row for typical table)
+// MEMORY USAGE ANALYSIS & OPTIMIZATION:
+// 
+// Previous approach (tuple-insert with batch commits):
+// - Per-row memory: TupleTableSlot (120-200 bytes) + Datum array (~80 bytes/row)
 //                  + FmgrInfo array + type conversion overhead
-// - Batch memory: 5000 rows × ~200-300 bytes/row = ~1-1.5 MB per batch minimum
-// - Additional overhead: PostgreSQL WAL buffers, SPI context, type conversion functions
-// - Estimated total: ~5-10 MB per 5000 rows (varies by table schema complexity)
+// - Estimated total: ~5-10 MB per 5000 rows (varies by table schema)
 //
-// Root cause: table_tuple_insert() (line 170) constructs full tuples in memory before SPI_commit()
-//            Each row requires TupleTableSlot allocation, Datum conversions, and WAL buffer space
-//            Memory accumulates until SPI_commit() at BATCH_SIZE intervals (line 187-188)
+// Current approach (Multi-row INSERT VALUES via SPI):
+// - CSV string generation: ~200 bytes/row (text representation)
+// - Buffer accumulation: 5000 rows × ~200 bytes = ~1 MB max
+// - Single SPI_exec call with multi-row INSERT VALUES statement
+// - Memory reduction: ~90% (from ~5-10 MB to ~1 MB per 5000 rows)
 //
-// Solution: CSV generation + PostgreSQL COPY command
-//          - Generate CSV to temporary file (minimal memory: ~4KB buffer)
-//          - Use COPY FROM to bulk load (PostgreSQL handles parsing efficiently)
-//          - Memory reduction: ~99% (from ~10 MB to ~10 KB per 5000 rows)
+// Why not COPY FROM STDIN?
+// - PostgreSQL's COPY FROM file cannot be executed via SPI_exec() (requires superuser/filesystem)
+// - COPY FROM STDIN with CopyState API requires complex cursor handling
+// - Multi-row INSERT VALUES achieves similar performance with simpler implementation
+//
+// Implementation: 
+// - Generate CSV rows in memory (std::vector<std::string>)
+// - Build INSERT INTO table VALUES (row1), (row2), ..., (rowN) statement
+// - Execute via SPI_exec as single batch
+// - Memory is released after each batch
 
 #pragma once
 
-#include <cstdio>
 #include <format>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <unistd.h>
+#include <vector>
 #include "date.h"
 
 extern "C" {
@@ -56,9 +62,14 @@ namespace tpcds {
 
 class TableLoader {
  public:
-  static constexpr size_t BATCH_SIZE = 5000;  // Flush CSV every 5000 rows
+  static constexpr size_t BATCH_SIZE = 1000;  // Flush every 1000 rows for optimal performance
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
+    // Connect to SPI for executing INSERT statements
+    if (SPI_connect() != SPI_OK_CONNECT) {
+      throw std::runtime_error("SPI_connect Failed");
+    }
+    
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
     rel_ = try_table_open(reloid_, NoLock);
     if (!rel_)
@@ -67,13 +78,14 @@ class TableLoader {
     auto tupDesc = RelationGetDescr(rel_);
     num_columns_ = tupDesc->natts;
     
-    // Open initial CSV file
-    openCSVFile();
+    // Reserve space for batch to avoid reallocations
+    csv_rows_.reserve(BATCH_SIZE);
   };
 
   ~TableLoader() {
     flush();  // Ensure remaining rows are committed
     table_close(rel_, NoLock);
+    SPI_finish();  // Disconnect from SPI
   };
 
   bool ColnullCheck() { return nullCheck(table_def->first_column + current_item_); }
@@ -115,7 +127,7 @@ class TableLoader {
     if (ColnullCheck()) {
       return nullItem();
     } else {
-      addCSVValue(value ? "t" : "f");
+      addCSVValue(value ? "'t'" : "'f'");
       current_item_++;
       return *this;
     }
@@ -170,7 +182,7 @@ class TableLoader {
       auto date = date_t{};
       jtodt(&date, static_cast<int>(value));
 
-      auto s = std::format("{:4d}-{:02d}-{:02d}", date.year, date.month, date.day);
+      auto s = std::format("'{:4d}-{:02d}-{:02d}'", date.year, date.month, date.day);
       addCSVValue(s);
       current_item_++;
       return *this;
@@ -184,12 +196,9 @@ class TableLoader {
   }
 
   auto& end() {
-    // Write complete CSV row to file
-    if (!csv_row_.empty() && csv_file_) {
-      int result = fprintf(csv_file_, "%s\n", csv_row_.c_str());
-      if (result < 0) {
-        elog(ERROR, "Failed to write to CSV file");
-      }
+    // Store complete CSV row in memory buffer
+    if (!csv_row_.empty()) {
+      csv_rows_.push_back(csv_row_);
     }
     
     row_count_++;
@@ -205,91 +214,65 @@ class TableLoader {
   auto row_count() const { return row_count_; }
 
   void flush() {
-    if (rows_in_batch_ == 0) return;
+    if (rows_in_batch_ == 0 || csv_rows_.empty()) return;
 
-    elog(INFO, "Flushing %zu rows from CSV", rows_in_batch_);
-
-    // Flush and close CSV file
-    if (csv_file_) {
-      fflush(csv_file_);  // Ensure all data is written
-      fclose(csv_file_);
-      csv_file_ = nullptr;
+    // Build multi-row INSERT VALUES statement
+    // INSERT INTO table_name VALUES (row1), (row2), ..., (rowN)
+    std::string insert_cmd = std::format("INSERT INTO {} VALUES ", table_def->name);
+    
+    for (size_t i = 0; i < csv_rows_.size(); i++) {
+      if (i > 0) {
+        insert_cmd += ", ";
+      }
+      insert_cmd += "(" + csv_rows_[i] + ")";
     }
-
-    elog(INFO, "CSV file closed, starting COPY");
-
-    // Execute COPY command to load CSV
-    // Note: We cannot use SPI_commit() here because we're in a function, not a procedure
-    std::string copy_cmd = std::format(
-        "COPY {} FROM '{}' WITH (FORMAT CSV, NULL 'NULL')",
-        table_def->name, csv_path_);
     
-    elog(INFO, "Executing: %s", copy_cmd.c_str());
+    // Execute multi-row INSERT via SPI
+    int ret = SPI_exec(insert_cmd.c_str(), 0);
     
-    int ret = SPI_exec(copy_cmd.c_str(), 0);
-    
-    elog(INFO, "SPI_exec returned: %d (expected %d for SPI_OK_UTILITY)", ret, SPI_OK_UTILITY);
-    
-    if (ret != SPI_OK_UTILITY) {
-      if (csv_file_) fclose(csv_file_);
-      unlink(csv_path_.c_str());
+    if (ret < 0) {
       ereport(ERROR,
               (errcode(ERRCODE_INTERNAL_ERROR),
-               errmsg("COPY command failed with return code %d: %s", ret, copy_cmd.c_str())));
+               errmsg("Multi-row INSERT failed with return code %d for table %s", ret, table_def->name)));
     }
 
-    elog(INFO, "COPY command succeeded");
-
-    elog(INFO, "Successfully loaded %zu rows", rows_in_batch_);
-
-    // Delete temporary CSV file
-    unlink(csv_path_.c_str());
-
+    // Clear buffer for next batch
+    csv_rows_.clear();
     rows_in_batch_ = 0;
-    
-    // Open new CSV file for next batch
-    openCSVFile();
   }
 
  private:
-  void openCSVFile() {
-    // Generate temporary CSV file path in /tmp
-    csv_path_ = std::format("/tmp/tpcds_{}_{}.csv", table_def->name, getpid());
-    
-    csv_file_ = fopen(csv_path_.c_str(), "w");
-    if (!csv_file_) {
-      ereport(ERROR,
-              (errcode(ERRCODE_INTERNAL_ERROR),
-               errmsg("Failed to open CSV file: %s", csv_path_.c_str())));
-    }
-    elog(INFO, "Opened CSV file: %s", csv_path_.c_str());
-  }
-
-  std::string escapeCSV(const std::string& value) {
-    std::string result;
-    bool needs_quotes = false;
+  // Escape string for SQL VALUES clause (not CSV)
+  // SQL standard: single quotes are escaped by doubling ('text''s' -> 'text''''s')
+  std::string escapeSQL(const std::string& value) {
+    std::string result = "'";
     
     for (char c : value) {
-      if (c == '"') {
-        result += "\"\"";  // Escape quotes by doubling
-        needs_quotes = true;
-      } else if (c == ',' || c == '\n' || c == '\r') {
-        result += c;
-        needs_quotes = true;
+      if (c == '\'') {
+        result += "''";  // Escape single quote by doubling
+      } else if (c == '\\') {
+        result += "\\\\";  // Escape backslash
       } else {
         result += c;
       }
     }
     
-    if (needs_quotes) {
-      return "\"" + result + "\"";
-    }
+    result += "'";
     return result;
   }
 
-  std::string escapeCSV(const char* value) {
+  std::string escapeSQL(const char* value) {
     if (value == nullptr) return "NULL";
-    return escapeCSV(std::string(value));
+    return escapeSQL(std::string(value));
+  }
+  
+  // Keep escapeCSV name for backward compatibility in calling code
+  std::string escapeCSV(const std::string& value) {
+    return escapeSQL(value);
+  }
+  
+  std::string escapeCSV(const char* value) {
+    return escapeSQL(value);
   }
 
   void addCSVValue(const std::string& value) {
@@ -306,9 +289,8 @@ class TableLoader {
   size_t rows_in_batch_ = 0;
   size_t num_columns_ = 0;
 
-  FILE* csv_file_ = nullptr;
-  std::string csv_path_;
-  std::string csv_row_;
+  std::vector<std::string> csv_rows_;  // Buffer for batch rows
+  std::string csv_row_;                // Current row being built
 
   const tpcds_table_def* table_def;
 };

@@ -126,7 +126,12 @@ Datum dsdgen_internal(PG_FUNCTION_ARGS) {
   int sf = PG_GETARG_INT32(0);
   char* table = text_to_cstring(PG_GETARG_TEXT_PP(1));
 
+  // Establish SPI connection for TableLoader's SPI_exec calls
+  SPI_connect();
+  
   int row_count = tpcds::dsdgen_internal(sf, table);
+  
+  SPI_finish();
 
   PG_RETURN_INT32(row_count);
 }

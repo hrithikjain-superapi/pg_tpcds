@@ -185,8 +185,11 @@ class TableLoader {
 
   auto& end() {
     // Write complete CSV row to file
-    if (!csv_row_.empty()) {
-      fprintf(csv_file_, "%s\n", csv_row_.c_str());
+    if (!csv_row_.empty() && csv_file_) {
+      int result = fprintf(csv_file_, "%s\n", csv_row_.c_str());
+      if (result < 0) {
+        elog(ERROR, "Failed to write to CSV file");
+      }
     }
     
     row_count_++;
@@ -204,6 +207,8 @@ class TableLoader {
   void flush() {
     if (rows_in_batch_ == 0) return;
 
+    elog(INFO, "Flushing %zu rows from CSV", rows_in_batch_);
+
     // Close CSV file
     if (csv_file_) {
       fclose(csv_file_);
@@ -219,16 +224,22 @@ class TableLoader {
         "COPY {} FROM '{}' WITH (FORMAT CSV, NULL 'NULL')",
         table_def->name, csv_path_);
     
+    elog(INFO, "Executing: %s", copy_cmd.c_str());
+    
     int ret = SPI_exec(copy_cmd.c_str(), 0);
     if (ret != SPI_OK_UTILITY) {
       if (csv_file_) fclose(csv_file_);
       unlink(csv_path_.c_str());
-      throw std::runtime_error(std::format("COPY command failed: {}", copy_cmd));
+      ereport(ERROR,
+              (errcode(ERRCODE_INTERNAL_ERROR),
+               errmsg("COPY command failed: %s", copy_cmd.c_str())));
     }
 
     // Commit COPY transaction
     SPI_commit();
     SPI_start_transaction();
+
+    elog(INFO, "Successfully loaded %zu rows", rows_in_batch_);
 
     // Delete temporary CSV file
     unlink(csv_path_.c_str());
@@ -246,8 +257,11 @@ class TableLoader {
     
     csv_file_ = fopen(csv_path_.c_str(), "w");
     if (!csv_file_) {
-      throw std::runtime_error(std::format("Failed to open CSV file: {}", csv_path_));
+      ereport(ERROR,
+              (errcode(ERRCODE_INTERNAL_ERROR),
+               errmsg("Failed to open CSV file: %s", csv_path_.c_str())));
     }
+    elog(INFO, "Opened CSV file: %s", csv_path_.c_str());
   }
 
   std::string escapeCSV(const std::string& value) {

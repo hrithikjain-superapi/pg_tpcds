@@ -218,13 +218,8 @@ class TableLoader {
 
     elog(INFO, "CSV file closed, starting COPY");
 
-    // Commit current transaction before COPY
-    SPI_commit();
-    SPI_start_transaction();
-    
-    elog(INFO, "Transaction committed and restarted");
-
     // Execute COPY command to load CSV
+    // Note: We cannot use SPI_commit() here because we're in a function, not a procedure
     std::string copy_cmd = std::format(
         "COPY {} FROM '{}' WITH (FORMAT CSV, NULL 'NULL')",
         table_def->name, csv_path_);
@@ -244,10 +239,6 @@ class TableLoader {
     }
 
     elog(INFO, "COPY command succeeded");
-
-    // Commit COPY transaction
-    SPI_commit();
-    SPI_start_transaction();
 
     elog(INFO, "Successfully loaded %zu rows", rows_in_batch_);
 

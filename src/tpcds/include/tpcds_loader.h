@@ -35,7 +35,7 @@ namespace tpcds {
 
 class TableLoader {
  public:
-  static constexpr size_t BATCH_SIZE = 100000;  // Commit every 100k rows
+  static constexpr size_t BATCH_SIZE = 5000;  // Commit every 5k rows - more frequent commits
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
@@ -192,6 +192,7 @@ class TableLoader {
     if (rows_in_buffer_ == 0) return;
 
     // Commit current transaction and start new one
+    // This releases memory from the previous transaction
     SPI_commit();
     SPI_start_transaction();
 

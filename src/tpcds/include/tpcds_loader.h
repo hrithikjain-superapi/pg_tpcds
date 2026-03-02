@@ -35,7 +35,7 @@ namespace tpcds {
 
 class TableLoader {
  public:
-  static constexpr size_t BATCH_SIZE = 5000;  // Commit every 5k rows - more frequent commits
+  static constexpr size_t BATCH_SIZE = 1000;  // Commit every 1000 rows - more frequent commits for memory
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
@@ -66,7 +66,7 @@ class TableLoader {
     free(in_functions);
     free(typioparams);
     ExecDropSingleTupleTableSlot(slot);
-  }
+  };
 
   bool ColnullCheck() { return nullCheck(table_def->first_column + current_item_); }
 

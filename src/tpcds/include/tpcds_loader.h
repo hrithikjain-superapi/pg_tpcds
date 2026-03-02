@@ -209,15 +209,20 @@ class TableLoader {
 
     elog(INFO, "Flushing %zu rows from CSV", rows_in_batch_);
 
-    // Close CSV file
+    // Flush and close CSV file
     if (csv_file_) {
+      fflush(csv_file_);  // Ensure all data is written
       fclose(csv_file_);
       csv_file_ = nullptr;
     }
 
+    elog(INFO, "CSV file closed, starting COPY");
+
     // Commit current transaction before COPY
     SPI_commit();
     SPI_start_transaction();
+    
+    elog(INFO, "Transaction committed and restarted");
 
     // Execute COPY command to load CSV
     std::string copy_cmd = std::format(
@@ -227,13 +232,18 @@ class TableLoader {
     elog(INFO, "Executing: %s", copy_cmd.c_str());
     
     int ret = SPI_exec(copy_cmd.c_str(), 0);
+    
+    elog(INFO, "SPI_exec returned: %d (expected %d for SPI_OK_UTILITY)", ret, SPI_OK_UTILITY);
+    
     if (ret != SPI_OK_UTILITY) {
       if (csv_file_) fclose(csv_file_);
       unlink(csv_path_.c_str());
       ereport(ERROR,
               (errcode(ERRCODE_INTERNAL_ERROR),
-               errmsg("COPY command failed: %s", copy_cmd.c_str())));
+               errmsg("COPY command failed with return code %d: %s", ret, copy_cmd.c_str())));
     }
+
+    elog(INFO, "COPY command succeeded");
 
     // Commit COPY transaction
     SPI_commit();

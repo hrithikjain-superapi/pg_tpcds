@@ -2,6 +2,9 @@
 
 #include <format>
 #include <stdexcept>
+#include <fstream>
+#include <iostream>
+#include <iomanip>
 #include "date.h"
 
 extern "C" {
@@ -15,6 +18,7 @@ extern "C" {
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
 #include <commands/copy.h>
+#include <utils/guc.h>
 
 // TODO split pg functions into other file
 
@@ -34,34 +38,29 @@ extern "C" {
 
 namespace tpcds {
 
-// Escape string for COPY/INSERT
-static void escape_copy_string(StringInfo buf, const char* str) {
+// Escape string for COPY
+static void escape_copy_string(std::ostream& os, const char* str) {
     if (str == nullptr) {
         return;  // NULL
     }
-    // Escape backslashes first, then other special chars
     for (const char* p = str; *p; p++) {
         if (*p == '\\') {
-            appendStringInfoChar(buf, '\\');
-            appendStringInfoChar(buf, '\\');
+            os << "\\\\";
         } else if (*p == '\t') {
-            appendStringInfoChar(buf, '\\');
-            appendStringInfoChar(buf, 't');
+            os << "\\t";
         } else if (*p == '\n') {
-            appendStringInfoChar(buf, '\\');
-            appendStringInfoChar(buf, 'n');
+            os << "\\n";
         } else if (*p == '\r') {
-            appendStringInfoChar(buf, '\\');
-            appendStringInfoChar(buf, 'r');
+            os << "\\r";
         } else {
-            appendStringInfoChar(buf, *p);
+            os << *p;
         }
     }
 }
 
 class TableLoader {
  public:
-  static constexpr size_t BATCH_SIZE = 10000;  // Rows per COPY batch
+  static constexpr size_t BATCH_SIZE = 100000;  // Rows per file batch
 
   TableLoader(const tpcds_table_def* table_def) : table_def(table_def) {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_def->name));
@@ -89,23 +88,40 @@ class TableLoader {
     slot = MakeSingleTupleTableSlot(tupDesc, &TTSOpsMinimalTuple);
     slot->tts_tableOid = RelationGetRelid(rel_);
     
-    // Initialize CSV buffer
-    csv_buffer = (StringInfo)palloc(sizeof(StringInfoData));
-    initStringInfo(csv_buffer);
+    // Open temp file for CSV output
+    current_batch_ = 0;
+    openBatchFile();
   };
 
   ~TableLoader() {
-    flush();  // Ensure remaining buffered rows are committed
+    flush();  // Ensure remaining rows are written
+    closeBatchFile();
     table_close(rel_, NoLock);
     free(in_functions);
     free(typioparams);
     free(att_type_oids);
     ExecDropSingleTupleTableSlot(slot);
-    if (csv_buffer) {
-      pfree(csv_buffer->data);
-      pfree(csv_buffer);
-    }
   };
+
+  void openBatchFile() {
+    if (csv_file_.is_open()) {
+      csv_file_.close();
+    }
+    
+    // Build filename in /tmp
+    std::string filename = std::string("/tmp/") + table_def->name + "_" + std::to_string(current_batch_) + ".csv";
+    csv_file_.open(filename, std::ios::out | std::ios::binary);
+    if (!csv_file_.is_open()) {
+      throw std::runtime_error(std::string("Failed to open batch file: ") + filename);
+    }
+    rows_in_batch_ = 0;
+  }
+
+  void closeBatchFile() {
+    if (csv_file_.is_open()) {
+      csv_file_.close();
+    }
+  }
 
   bool ColnullCheck() { return nullCheck(table_def->first_column + current_item_); }
 
@@ -205,15 +221,15 @@ class TableLoader {
     return *this;
   }
 
-  // Convert current tuple to CSV format in buffer
-  void tupleToCSV() {
-    if (rows_in_buffer_ > 0) {
-      appendStringInfoChar(csv_buffer, '\n');
+  // Write current tuple to CSV file
+  void writeTupleToCSV() {
+    if (rows_in_batch_ > 0) {
+      csv_file_ << '\n';
     }
     
     for (auto i = 0; i < ncols_; i++) {
       if (i > 0) {
-        appendStringInfoChar(csv_buffer, '\t');
+        csv_file_ << '\t';
       }
       
       if (slot->tts_isnull[i]) {
@@ -225,21 +241,21 @@ class TableLoader {
       
       // Handle different types
       if (typid == BOOLOID) {
-        appendStringInfoChar(csv_buffer, DatumGetBool(value) ? 't' : 'f');
+        csv_file_ << (DatumGetBool(value) ? 't' : 'f');
       } else if (typid == INT2OID) {
-        appendStringInfo(csv_buffer, "%d", (int)DatumGetInt16(value));
+        csv_file_ << (int)DatumGetInt16(value);
       } else if (typid == INT4OID) {
-        appendStringInfo(csv_buffer, "%d", DatumGetInt32(value));
+        csv_file_ << DatumGetInt32(value);
       } else if (typid == INT8OID) {
-        appendStringInfo(csv_buffer, "%lld", (long long)DatumGetInt64(value));
+        csv_file_ << (long long)DatumGetInt64(value);
       } else if (typid == FLOAT4OID) {
-        appendStringInfo(csv_buffer, "%.6g", (double)DatumGetFloat4(value));
+        csv_file_ << std::setprecision(6) << (double)DatumGetFloat4(value);
       } else if (typid == FLOAT8OID) {
-        appendStringInfo(csv_buffer, "%.6g", DatumGetFloat8(value));
+        csv_file_ << std::setprecision(6) << DatumGetFloat8(value);
       } else {
         // Text types - get as cstring and escape
         Datum textValue = DirectFunctionCall1(textout, value);
-        escape_copy_string(csv_buffer, (const char*)textValue);
+        escape_copy_string(csv_file_, (const char*)textValue);
       }
     }
   }
@@ -247,14 +263,14 @@ class TableLoader {
   auto& end() {
     ExecStoreVirtualTuple(slot);
 
-    // Convert to CSV format
-    tupleToCSV();
+    // Write to CSV file
+    writeTupleToCSV();
     
     row_count_++;
-    rows_in_buffer_++;
+    rows_in_batch_++;
 
-    // Auto-flush when batch is full
-    if (rows_in_buffer_ >= BATCH_SIZE) {
+    // Open new file when batch is full
+    if (rows_in_batch_ >= BATCH_SIZE) {
       flush();
     }
 
@@ -264,38 +280,37 @@ class TableLoader {
   auto row_count() const { return row_count_; }
 
   void flush() {
-    if (rows_in_buffer_ == 0) return;
+    if (rows_in_batch_ == 0) return;
 
-    // Build COPY statement
-    StringInfo copy_sql = makeStringInfo();
-    appendStringInfo(copy_sql, "COPY %s FROM STDIN WITH (FORMAT CSV, DELIMITER '\t', NULL '')", 
-                    table_def->name);
-    
-    // Execute COPY using SPI
-    // Note: This requires proper COPY protocol handling which is complex
-    // Fall back to INSERT for now - but this still helps by batching
-    
-    // Build multi-row INSERT as fallback
-    StringInfo insert_sql = makeStringInfo();
-    appendStringInfo(insert_sql, "INSERT INTO %s VALUES ", table_def->name);
-    
-    // We can't easily re-parse the CSV, so for now just commit
-    // The real solution would be to properly use COPY FROM
-    
-    SPI_commit();
-    SPI_start_transaction();
+    // Close current file
+    csv_file_.flush();
+    csv_file_.close();
 
-    // Clear the CSV buffer
-    resetStringInfo(csv_buffer);
-    rows_in_buffer_ = 0;
+    // Load this batch via COPY
+    std::string filename = std::string("/tmp/") + table_def->name + "_" + std::to_string(current_batch_) + ".csv";
+    
+    std::string copy_sql = "COPY " + std::string(table_def->name) + 
+                           " FROM '" + filename + "' WITH (FORMAT CSV, DELIMITER '\t', NULL '')";
+    
+    SPI_exec(copy_sql.c_str(), 0);
+    
+    // Delete the temp file
+    std::remove(filename.c_str());
+    
+    // Move to next batch
+    current_batch_++;
+    openBatchFile();
   }
 
   Oid reloid_;
   Relation rel_;
   size_t row_count_ = 0;
   size_t current_item_ = 0;
-  size_t rows_in_buffer_ = 0;
+  size_t rows_in_batch_ = 0;
+  size_t current_batch_;
   int ncols_;
+
+  std::ofstream csv_file_;
 
   FmgrInfo* in_functions;
   Oid* typioparams;
@@ -305,7 +320,6 @@ class TableLoader {
   int ti_options = (TABLE_INSERT_SKIP_FSM | TABLE_INSERT_FROZEN | TABLE_INSERT_NO_LOGICAL);
 
   const tpcds_table_def* table_def;
-  StringInfo csv_buffer;
 };
 
 }  // namespace tpcds
